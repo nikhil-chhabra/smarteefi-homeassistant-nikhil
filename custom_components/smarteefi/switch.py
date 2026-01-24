@@ -150,13 +150,71 @@ class SmarteefiSwitch(SwitchEntity):
     async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
         _LOGGER.info("Turning on Smarteefi switch: %s", self._name)
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"]):
+        success = await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"])
+        if success:
+            # Optimistically update state
             self._state = True
             self.schedule_update_ha_state()
+            # Sync state after a short delay to verify actual device state
+            await asyncio.sleep(0.5)
+            await self._sync_state()
+        else:
+            _LOGGER.warning(f"Failed to turn on switch {self._name}, syncing state to verify")
+            await self._sync_state()
 
     async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
         _LOGGER.info("Turning off Smarteefi switch: %s", self._name)
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"]):
+        success = await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"])
+        if success:
+            # Optimistically update state
             self._state = False
             self.schedule_update_ha_state()
+            # Sync state after a short delay to verify actual device state
+            await asyncio.sleep(0.5)
+            await self._sync_state()
+        else:
+            _LOGGER.warning(f"Failed to turn off switch {self._name}, syncing state to verify")
+            await self._sync_state()
+
+    async def _sync_state(self):
+        """Sync the switch state from the device."""
+        command = [
+            self.ip_address,
+            self.netmask,
+            "get-status",
+            self._unique_id,
+            str(self._cloud_id)
+        ]
+        
+        _LOGGER.debug(f"Syncing state for switch {self._name}")
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._hacli, *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                output = stdout.decode().strip()
+                try:
+                    status = int(output)
+                    # Calculate state: ON if smap is set in status, OFF if status is 0
+                    new_state = (status != 0) and (self._smap & status)
+                    
+                    if self._state != new_state:
+                        self._state = new_state
+                        self.schedule_update_ha_state()
+                        _LOGGER.debug(
+                            f"Synced switch {self._name} - "
+                            f"State: {'on' if new_state else 'off'}, "
+                            f"Smap: {self._smap}, Status: {status}"
+                        )
+                except ValueError:
+                    _LOGGER.error(f"Invalid status output for {self._name}: {output}")
+            else:
+                _LOGGER.error(f"State sync failed for {self._name}: {stderr.decode().strip()}")
+        except Exception as e:
+            _LOGGER.error(f"Error syncing state for {self._name}: {e}")
