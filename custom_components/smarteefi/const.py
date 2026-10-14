@@ -1,3 +1,4 @@
+import os
 import platform
 
 architecture = platform.machine().lower()  # Convert to lowercase for case-insensitive comparison
@@ -15,18 +16,31 @@ else:
 
 system = platform.system()
 if system == 'Windows':
-    os = 'win'
+    os_name = 'win'
 elif system == 'Linux':
-    os = 'linux'
+    os_name = 'linux'
 elif system == 'Darwin':
-    os = 'mac'
+    os_name = 'mac'
 else:
-    os = 'unknown'
+    os_name = 'unknown'
 
 
 DOMAIN = 'smarteefi'
 ARCH = arch
-OS=os
+OS = os_name
+
+PLATFORMS = ["switch", "fan", "light", "cover"]
+
+# Full path to the HACLI binary bundled with this integration
+HACLI_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    f"hacli-{OS}-{ARCH}",
+    "smarteefi-ha-cli.exe" if OS == 'win' else "smarteefi-ha-cli",
+)
+
+UDP_PORT = 8890  # Port devices push status updates to
+
+CLI_TIMEOUT = 10  # Seconds before a HACLI call is abandoned
 
 INITIAL_SYNC_INTERVAL = 5 # Sync interval for the first sync after HA Restart
 SYNC_INTERVAL = 3 # Sync interval in seconds

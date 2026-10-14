@@ -1,15 +1,47 @@
+import asyncio
 import logging
-import aiohttp
 import os
-import stat
+import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from .const import DOMAIN, ARCH, OS
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from .const import DOMAIN, HACLI_PATH
 
 _LOGGER = logging.getLogger(__name__)
 
 API_URL = "https://www.smarteefi.com/api/homeassistant_v1/user/validatehatoken"
+
+
+async def _validate_api_token(hass, apitoken):
+    """Validate the API token against the cloud API. Return an error key, or None if valid."""
+    payload = {
+        "UserDevice": {
+            "hatoken": apitoken
+        }
+    }
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    try:
+        session = async_get_clientsession(hass)
+        async with session.post(
+            API_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            if response.status != 200:
+                _LOGGER.error(f"API request failed with status code: {response.status}")
+                return "cannot_connect"
+            data = await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        _LOGGER.error(f"Exception occurred while validating API token: {e}")
+        return "cannot_connect"
+
+    if data.get("result") != "success":
+        _LOGGER.error(f"API token validation failed: {data.get('error_desc', data)}")
+        return "invalid_token"
+    return None
+
 
 class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Smarteefi IoT Platform."""
@@ -18,35 +50,27 @@ class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input=None):
         """Prompt user to enter apitoken."""
-        errors = {}  # Reinitialize errors dictionary
+        # One entry per Home Assistant: the UDP listener and device polling are host-wide
+        if self._async_current_entries():
+            return self.async_abort(reason="already_configured")
 
-        # Get correct integration path
-        INTEGRATION_PATH = self.hass.config.path(f"custom_components/smarteefi")
-    
-        # Full path to HACLI binary
-        if(OS=='win'):
-            HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-        else:
-            HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-        self.set_executable_permissions(HACLI)
-        _LOGGER.debug(f"Using HACLI path: {HACLI}")            
+        if not await self.hass.async_add_executor_job(os.path.exists, HACLI_PATH):
+            _LOGGER.error(f"CLI not found at {HACLI_PATH}")
+            return self.async_abort(reason="unsupported_platform")
+
+        errors = {}
 
         if user_input is not None:
             apitoken = user_input["apitoken"]
 
             # Validate the API token
-            validation_result = await self._validate_api_token(apitoken)
-            if validation_result.get("result") != "success":
-                _LOGGER.error(f"Validation Result: {validation_result}")
-                myerror = validation_result.get("error_desc", "invalid_token")
-                _LOGGER.error(f"API token validation failed myerror: {myerror}")
-                errors["base"] = validation_result.get("error_desc", "invalid_token")  # Update errors with new error
-                _LOGGER.error(f"API token validation failed: {errors['base']}")
+            error = await _validate_api_token(self.hass, apitoken)
+            if error:
+                errors["base"] = error
             else:
-                # Store apitoken and set network_interface, ip_address, and netmask to empty strings
+                # Network details are detected when the entry is set up
                 return self.async_create_entry(
-                    title=DOMAIN, 
+                    title=DOMAIN,
                     data={
                         "apitoken": apitoken,
                         "network_interface": "",
@@ -61,78 +85,36 @@ class SmarteefiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema({
                 vol.Required("apitoken"): str,
             }),
-            errors=errors,  # Pass the updated errors dictionary
+            errors=errors,
         )
-    
-    def set_executable_permissions(self, file_path: str) -> None:
-        """Set executable permissions on the specified file."""
-        if os.path.exists(file_path):
-            # Get current permissions
-            current_perms = os.stat(file_path).st_mode
-            # Add execute permission for owner, group, and others (equivalent to chmod +x)
-            os.chmod(file_path, current_perms | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        else:
-            # Log an error if the file isn’t found (optional, requires hass.logger)
-            _LOGGER(f"CLI not found at {file_path}")
-
-    async def _validate_api_token(self, apitoken):
-        """Validate the API token by making a POST request to the cloud API."""
-        payload = {
-            "UserDevice": {
-                "hatoken": apitoken
-            }
-        }
-        headers = {
-            "Content-Type": "application/json",
-        }
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(API_URL, json=payload, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data
-                    else:
-                        _LOGGER.error(f"API request failed with status code: {response.status}")
-                        return {"result": "error", "error_desc": "API request failed"}
-        except Exception as e:
-            _LOGGER.error(f"Exception occurred while validating API token: {e}")
-            return {"result": "error", "error_desc": str(e)}
 
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
         """Return the options flow handler."""
-        return SmarteefiOptionsFlowHandler(config_entry)
+        return SmarteefiOptionsFlowHandler()
 
 
 class SmarteefiOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for editing apitoken."""
 
-    def __init__(self, config_entry):
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
     async def async_step_init(self, user_input=None):
         """Allow user to update apitoken."""
-        errors = {}  # Reinitialize errors dictionary
+        errors = {}
 
         if user_input is not None:
             # Validate the API token
-            validation_result = await self._validate_api_token(user_input["apitoken"])
-            if validation_result.get("result") != "success":
-                errors["base"] = validation_result.get("error_desc", "invalid_token")  # Update errors with new error
+            error = await _validate_api_token(self.hass, user_input["apitoken"])
+            if error:
+                errors["base"] = error
             else:
-                # Update config entry with new data
-                return self.async_create_entry(
-                    title="",
-                    data={
-                        "apitoken": user_input["apitoken"],
-                        "network_interface": self.config_entry.data["network_interface"],
-                        "ip_address": self.config_entry.data["ip_address"],
-                        "netmask": self.config_entry.data["netmask"],
-                    },
+                # The token lives in entry.data, which the integration reads; the
+                # entry's update listener reloads it with the new token.
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry,
+                    data={**self.config_entry.data, "apitoken": user_input["apitoken"]},
                 )
+                return self.async_create_entry(title="", data={})
 
         # Show form for updating apitoken
         return self.async_show_form(
@@ -140,30 +122,5 @@ class SmarteefiOptionsFlowHandler(config_entries.OptionsFlow):
             data_schema=vol.Schema({
                 vol.Required("apitoken", default=self.config_entry.data["apitoken"]): str,
             }),
-            errors=errors,  # Pass the updated errors dictionary
+            errors=errors,
         )
-
-    async def _validate_api_token(self, apitoken):
-        """Validate the API token by making a POST request to the cloud API."""
-        payload = {
-            "UserDevice": {
-                "hatoken": apitoken
-            }
-        }
-        headers = {
-            "Content-Type": "application/json",
-        }
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(API_URL, json=payload, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data
-                    else:
-                        _LOGGER.error(f"API request failed with status code: {response.status}")
-                        return {"result": "error", "error_desc": "API request failed"}
-        except Exception as e:
-            _LOGGER.error(f"Exception occurred while validating API token: {e}")
-            return {"result": "error", "error_desc": str(e)}
-        

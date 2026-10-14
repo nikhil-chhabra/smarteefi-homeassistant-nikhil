@@ -1,220 +1,55 @@
 import logging
-import os
 import asyncio
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from .const import DOMAIN, ARCH, OS
+from .entity import SmarteefiEntity, build_entities
 
 _LOGGER = logging.getLogger(__name__)
 
-_LOGGER.info(f"Domain is {DOMAIN}")
-
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Smarteefi switches from a config entry."""
-    
-    # Get correct integration path
-    INTEGRATION_PATH = hass.config.path(f"custom_components/smarteefi")
-    
-    # Full path to HACLI binary
-    if(OS=='win'):
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-    else:
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-    _LOGGER.debug(f"Using HACLI path: {HACLI}")
+    async_add_entities(build_entities(entry, "switch", SmarteefiSwitch))
 
-    devices = entry.data.get("devices", [])
-
-    if not devices:
-        _LOGGER.error("No devices found for Smarteefi switch.")
-        return
-    
-    # Get host ip address from config_entry
-    ip_address = entry.data.get("ip_address")
-
-    if not ip_address:
-        _LOGGER.error("ip_address not found in config entry!")
-        return
-
-    # Get host ip address from config_entry
-    netmask = entry.data.get("netmask")
-
-    if not netmask:
-        _LOGGER.error("netmask not found in config entry!")
-        return            
-
-    # Pass network_interface to SmarteefiSwitch constructor
-    switches = [SmarteefiSwitch(device, HACLI, ip_address, netmask) for device in devices if device["type"] == "switch"]
-    async_add_entities(switches, True)
-
-class SmarteefiSwitch(SwitchEntity):
+class SmarteefiSwitch(SmarteefiEntity, SwitchEntity):
     """Representation of a Smarteefi switch."""
 
     def __init__(self, device, hacli_path, ip_address, netmask):
-        self._device = device
+        super().__init__(device, hacli_path, ip_address, netmask, "Unnamed Switch")
         self._state = False
-        self._name = device.get("name", "Unnamed Switch")
-        self._unique_id = device.get("id", "")  # Format: "serial:ignored:smap"
-        self._cloud_id = device.get("cloudid", "")
-        self._hacli = hacli_path
-        self.ip_address = ip_address
-        self.netmask = netmask
-        self._update_unsub = None
-        self._smap = None  # Store smap value from entity ID
 
-        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
-        parts = self._unique_id.split(':')
-        if len(parts) == 3:
-            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
-            self._smap = int(parts[2])
-        else:
-            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
-
-    async def async_added_to_hass(self):
-        """Register update dispatcher."""
-        if hasattr(self, '_entity_match_id'):
-            self._update_unsub = async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_device_update_{self._entity_match_id}",
-                self._handle_device_update
-            )
-
-    async def async_will_remove_from_hass(self):
-        """Unregister update dispatcher."""
-        if self._update_unsub:
-            self._update_unsub()
-
-    def _handle_device_update(self, data):
-        """Update state from UDP message."""
-        received_smap = data["smap"]
-        status = data["status"]
-        
-        # Only process if smap matches our entity's smap
-        if received_smap != self._smap:
-            return
-            
-        # Your logic: ON if smap == status, OFF if status == 0
-        new_state = (status != 0) and (received_smap & status)
-        
-        if self._state != new_state:
-            self._state = new_state
-            self.schedule_update_ha_state()
-            _LOGGER.debug(
-                f"Updated switch {self._name} - "
-                f"State: {'on' if new_state else 'off'}, "
-                f"Smap: {received_smap}, Status: {status}"
-            )
-
-    @property
-    def name(self):
-        """Return the name of the switch."""
-        return self._name
-
-    @property
-    def unique_id(self):
-        """Return a unique ID for the switch."""
-        return self._unique_id
+    def _apply_status(self, status):
+        # ON if our smap bit is set in status
+        new_state = bool(status & self._smap)
+        if self._state == new_state:
+            return False
+        self._state = new_state
+        _LOGGER.debug(
+            f"Updated switch {self.name} - "
+            f"State: {'on' if new_state else 'off'}, "
+            f"Smap: {self._smap}, Status: {status}"
+        )
+        return True
 
     @property
     def is_on(self):
         """Return True if the switch is on."""
         return self._state
 
-    async def _execute_cli(self, command):
-        """Run the HACLI binary with the given command."""
-        full_command = [self._hacli] + command
-
-        _LOGGER.debug(f"Executing CLI command: {' '.join(full_command)}")
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-
-            if process.returncode == 0:
-                _LOGGER.debug(f"Command succeeded: {' '.join(full_command)}, Output: {stdout.decode().strip()}")
-                return True
-            else:
-                _LOGGER.error(f"Command failed: {' '.join(full_command)}, Error: {stderr.decode().strip()}")
-                return False
-        except FileNotFoundError:
-            _LOGGER.error(f"CLI binary not found at {self._hacli}")
-            return False
-        except Exception as e:
-            _LOGGER.error(f"Error executing CLI: {e}")
-            return False
-
     async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
-        _LOGGER.info("Turning on Smarteefi switch: %s", self._name)
-        success = await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"])
-        if success:
-            # Optimistically update state
-            self._state = True
-            self.schedule_update_ha_state()
-            # Sync state after a short delay to verify actual device state
-            await asyncio.sleep(0.5)
-            await self._sync_state()
-        else:
-            _LOGGER.warning(f"Failed to turn on switch {self._name}, syncing state to verify")
-            await self._sync_state()
+        await self._set_state(True)
 
     async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
-        _LOGGER.info("Turning off Smarteefi switch: %s", self._name)
-        success = await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"])
-        if success:
+        await self._set_state(False)
+
+    async def _set_state(self, on):
+        _LOGGER.info("Turning %s Smarteefi switch: %s", "on" if on else "off", self.name)
+        if await self._execute_cli("set-status", "1" if on else "0"):
             # Optimistically update state
-            self._state = False
-            self.schedule_update_ha_state()
+            self._state = on
+            self.async_write_ha_state()
             # Sync state after a short delay to verify actual device state
             await asyncio.sleep(0.5)
-            await self._sync_state()
         else:
-            _LOGGER.warning(f"Failed to turn off switch {self._name}, syncing state to verify")
-            await self._sync_state()
-
-    async def _sync_state(self):
-        """Sync the switch state from the device."""
-        command = [
-            self.ip_address,
-            self.netmask,
-            "get-status",
-            self._unique_id,
-            str(self._cloud_id)
-        ]
-        
-        _LOGGER.debug(f"Syncing state for switch {self._name}")
-        
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                output = stdout.decode().strip()
-                try:
-                    status = int(output)
-                    # Calculate state: ON if smap is set in status, OFF if status is 0
-                    new_state = (status != 0) and (self._smap & status)
-                    
-                    if self._state != new_state:
-                        self._state = new_state
-                        self.schedule_update_ha_state()
-                        _LOGGER.debug(
-                            f"Synced switch {self._name} - "
-                            f"State: {'on' if new_state else 'off'}, "
-                            f"Smap: {self._smap}, Status: {status}"
-                        )
-                except ValueError:
-                    _LOGGER.error(f"Invalid status output for {self._name}: {output}")
-            else:
-                _LOGGER.error(f"State sync failed for {self._name}: {stderr.decode().strip()}")
-        except Exception as e:
-            _LOGGER.error(f"Error syncing state for {self._name}: {e}")
+            _LOGGER.warning(f"Failed to turn {'on' if on else 'off'} switch {self.name}, syncing state to verify")
+        await self._sync_state()

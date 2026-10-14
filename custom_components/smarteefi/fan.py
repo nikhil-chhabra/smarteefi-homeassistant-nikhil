@@ -1,158 +1,58 @@
 import logging
-import os
 import asyncio
 import math
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
-from homeassistant.util.percentage import ranged_value_to_percentage, percentage_to_ranged_value
+from homeassistant.util.percentage import percentage_to_ranged_value
 from homeassistant.util.scaling import int_states_in_range
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from .const import DOMAIN, ARCH, OS
+from .entity import SmarteefiEntity, build_entities
 
 SPEED_RANGE = (1, 4)
+SPEED_TO_PERCENTAGE = {0: 0, 1: 25, 2: 50, 3: 75, 4: 100}
 
 _LOGGER = logging.getLogger(__name__)
 
-_LOGGER.info(f"Domain is {DOMAIN}")
-
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Smarteefi fans from a config entry."""
-    
-    # Get correct integration path
-    INTEGRATION_PATH = hass.config.path(f"custom_components/smarteefi")
-    
-    # Full path to HACLI binary
-    if OS == 'win':
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-    else:
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-    _LOGGER.debug(f"Using HACLI path: {HACLI}")
+    async_add_entities(build_entities(entry, "fan", SmarteefiFan))
 
-    devices = entry.data.get("devices", [])
-
-    if not devices:
-        _LOGGER.error("No devices found for Smarteefi fan.")
-        return
-    
-    # Get host ip address from config_entry
-    ip_address = entry.data.get("ip_address")
-
-    if not ip_address:
-        _LOGGER.error("ip_address not found in config entry!")
-        return
-
-    # Get host ip address from config_entry
-    netmask = entry.data.get("netmask")
-
-    if not netmask:
-        _LOGGER.error("netmask not found in config entry!")
-        return            
-
-    # Pass network_interface to SmarteefiFan constructor
-    fans = [SmarteefiFan(device, HACLI, ip_address, netmask) for device in devices if device["type"] == "fan"]
-    async_add_entities(fans, True)
-
-class SmarteefiFan(FanEntity):
+class SmarteefiFan(SmarteefiEntity, FanEntity):
     """Representation of a Smarteefi fan."""
 
+    _attr_supported_features = (
+        FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF | FanEntityFeature.SET_SPEED
+    )
+    _enable_turn_on_off_backwards_compatibility = False
+
     def __init__(self, device, hacli_path, ip_address, netmask):
-        self._device = device
+        super().__init__(device, hacli_path, ip_address, netmask, "Unnamed Fan")
         self._state = False  # Assume the fan is off by default
-        self._name = device.get("name", "Unnamed Fan")  # Set name properly
-        self._unique_id = device.get("id", "")
-        self._cloud_id = device.get("cloudid", "")
-        self._hacli = hacli_path
-        self.ip_address = ip_address
-        self.netmask = netmask  
-        self._percentage = None
-        self._speed_count = 4
         self._speed = 0
-        self._update_unsub = None
-        self._smap = None  # Store smap value from entity ID
 
-        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
-        parts = self._unique_id.split(':')
-        if len(parts) == 3:
-            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
-            self._smap = int(parts[2])
+    def _apply_status(self, status):
+        previous = (self._state, self._speed)
+
+        # Speed flags: r1=0x10, r2=0x20, r3=0x40
+        if status & 0x40:
+            speed = 4
+        elif status & 0x20 and status & 0x10:
+            speed = 3
+        elif status & 0x20:
+            speed = 2
+        elif status & 0x10:
+            speed = 1
         else:
-            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
+            # Status 0, or no speed flags set: treat as off
+            speed = 0
 
-    async def async_added_to_hass(self):
-        """Register update dispatcher."""
-        if hasattr(self, '_entity_match_id'):
-            self._update_unsub = async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_device_update_{self._entity_match_id}",
-                self._handle_device_update
-            )
-
-    async def async_will_remove_from_hass(self):
-        """Unregister update dispatcher."""
-        if self._update_unsub:
-            self._update_unsub()
-
-    def _handle_device_update(self, data):
-        """Update state from UDP message."""
-        received_smap = data["smap"]
-        status = data["status"]
-        
-        # Only process if smap matches our entity's smap
-        if received_smap != self._smap:
-            return
-        
-        # Check if fan is off first
-        if status == 0:
-            self._state = False
-            self._speed = 0
-            self._percentage = 0
-        else:
-            self._state = True
-            # Check speed flags only if status is not 0
-            r1 = status & 0x10
-            r2 = status & 0x20
-            r3 = status & 0x40   
-
-            if r3:
-                self._percentage = 100
-                self._speed = 4
-            elif r2 and r1:
-                self._percentage = 75
-                self._speed = 3
-            elif r2:
-                self._percentage = 50
-                self._speed = 2
-            elif r1:
-                self._percentage = 25
-                self._speed = 1
-            else:
-                # If status is not 0 but no speed flags are set, assume off
-                self._state = False
-                self._speed = 0
-                self._percentage = 0
-
-        self.schedule_update_ha_state()
+        self._speed = speed
+        self._state = speed != 0
         _LOGGER.debug(
-            f"Updated fan {self._name} - "
+            f"Updated fan {self.name} - "
             f"State: {'on' if self._state else 'off'}, "
-            f"Percentage: {self._percentage}, Speed: {self._speed}"
-        )        
-            
-    @property
-    def name(self):
-        """Return the name of the fan."""
-        return self._name
-
-    @property
-    def unique_id(self):
-        """Return a unique ID for the fan."""
-        return self._unique_id
-    
-    @property
-    def supported_features(self):
-        """supported features."""
-        return FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF | FanEntityFeature.SET_SPEED
+            f"Percentage: {self.percentage}, Speed: {self._speed}, Status: {status}"
+        )
+        return previous != (self._state, self._speed)
 
     @property
     def is_on(self) -> bool | None:
@@ -162,82 +62,49 @@ class SmarteefiFan(FanEntity):
     @property
     def percentage(self) -> int | None:
         """Return the current speed percentage."""
-        # If fan is off or speed is 0, return 0
-        if not self._state or self._speed == 0:
+        if not self._state:
             return 0
-        # Use stored percentage if available, otherwise calculate from speed
-        if self._percentage is not None:
-            return self._percentage
-        return ranged_value_to_percentage(SPEED_RANGE, self._speed)
- 
+        return SPEED_TO_PERCENTAGE[self._speed]
+
     @property
     def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         return int_states_in_range(SPEED_RANGE)
-    
-    async def _execute_cli(self, command):
-        """Run the HACLI binary with the given command."""
-        full_command = [self._hacli] + command  # Prepend HACLI path
-
-        _LOGGER.debug(f"Executing CLI command: {' '.join(full_command)}")
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-
-            if process.returncode == 0:
-                _LOGGER.debug(f"Command succeeded: {' '.join(full_command)}, Output: {stdout.decode().strip()}")
-                return True
-            else:
-                _LOGGER.error(f"Command failed: {' '.join(full_command)}, Error: {stderr.decode().strip()}")
-                return False
-        except FileNotFoundError:
-            _LOGGER.error(f"CLI binary not found at {self._hacli}")
-            return False
-        except Exception as e:
-            _LOGGER.error(f"Error executing CLI: {e}")
-            return False
 
     async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
         """Turn the fan on."""
-        _LOGGER.info("Turning on Smarteefi fan: %s percentage: %s", self._name, percentage)
-        success = await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"])
-        if success:
-            self._state = True
-            if percentage:
-                await self.async_set_percentage(percentage)
-            else:
-                # If no percentage specified, use default speed or current speed
-                if self._speed == 0:
-                    self._speed = 2  # Default to speed 2 (50%)
-                    self._percentage = 50
-                self.schedule_update_ha_state()
-                # Sync state after a short delay to verify actual device state
-                await asyncio.sleep(0.5)
-                await self._sync_state()
-        else:
-            _LOGGER.warning(f"Failed to turn on fan {self._name}, syncing state to verify")
+        _LOGGER.info("Turning on Smarteefi fan: %s percentage: %s", self.name, percentage)
+        if percentage == 0:
+            await self.async_turn_off()
+            return
+        if not await self._execute_cli("set-status", "1"):
+            _LOGGER.warning(f"Failed to turn on fan {self.name}, syncing state to verify")
             await self._sync_state()
+            return
+        self._state = True
+        if percentage:
+            await self.async_set_percentage(percentage)
+            return
+        # If no percentage specified, keep the current speed or default to speed 2 (50%)
+        if self._speed == 0:
+            self._speed = 2
+        self.async_write_ha_state()
+        # Sync state after a short delay to verify actual device state
+        await asyncio.sleep(0.5)
+        await self._sync_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the fan off."""
-        _LOGGER.info("Turning off Smarteefi fan: %s", self._name)
-        success = await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"])
-        if success:
+        _LOGGER.info("Turning off Smarteefi fan: %s", self.name)
+        if await self._execute_cli("set-status", "0"):
             self._state = False
             self._speed = 0
-            self._percentage = 0
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
             # Sync state after a short delay to verify actual device state
             await asyncio.sleep(0.5)
-            await self._sync_state()
         else:
-            _LOGGER.warning(f"Failed to turn off fan {self._name}, syncing state to verify")
-            await self._sync_state()
+            _LOGGER.warning(f"Failed to turn off fan {self.name}, syncing state to verify")
+        await self._sync_state()
 
     async def async_set_percentage(self, percentage: int) -> None:
         """Set the speed of the fan."""
@@ -245,60 +112,15 @@ class SmarteefiFan(FanEntity):
             # Turn fan off if percentage is 0
             await self.async_turn_off()
             return
-            
+
         speed = math.ceil(percentage_to_ranged_value(SPEED_RANGE, percentage))
-        _LOGGER.info("Setting speed of Smarteefi fan: %s to %d", self._name, speed)
-        if speed:
-            success = await self._execute_cli([self.ip_address, self.netmask, "set-speed", self._unique_id, str(self._cloud_id), str(speed)])
-            if success:
-                self._speed = speed
-                self._state = True
-                # Map speed to percentage
-                if speed == 4:
-                    self._percentage = 100
-                elif speed == 3:
-                    self._percentage = 75
-                elif speed == 2:
-                    self._percentage = 50
-                elif speed == 1:
-                    self._percentage = 25
-                self.schedule_update_ha_state()
-                # Sync state after a short delay to verify actual device state
-                await asyncio.sleep(0.5)
-                await self._sync_state()
-            else:
-                _LOGGER.warning(f"Failed to set fan speed for {self._name}, syncing state to verify")
-                await self._sync_state()
-    
-    async def _sync_state(self):
-        """Sync the fan state from the device."""
-        command = [
-            self.ip_address,
-            self.netmask,
-            "get-status",
-            self._unique_id,
-            str(self._cloud_id)
-        ]
-        
-        _LOGGER.debug(f"Syncing state for fan {self._name}")
-        
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                output = stdout.decode().strip()
-                try:
-                    status = int(output)
-                    # Process the status update as if it came from UDP
-                    self._handle_device_update({"smap": self._smap, "status": status})
-                except ValueError:
-                    _LOGGER.error(f"Invalid status output for {self._name}: {output}")
-            else:
-                _LOGGER.error(f"State sync failed for {self._name}: {stderr.decode().strip()}")
-        except Exception as e:
-            _LOGGER.error(f"Error syncing state for {self._name}: {e}")
+        _LOGGER.info("Setting speed of Smarteefi fan: %s to %d", self.name, speed)
+        if await self._execute_cli("set-speed", str(speed)):
+            self._speed = speed
+            self._state = True
+            self.async_write_ha_state()
+            # Sync state after a short delay to verify actual device state
+            await asyncio.sleep(0.5)
+        else:
+            _LOGGER.warning(f"Failed to set fan speed for {self.name}, syncing state to verify")
+        await self._sync_state()

@@ -1,126 +1,40 @@
 import logging
-import os
-import asyncio
 
 from homeassistant.components.cover import (
+    ATTR_POSITION,
     CoverEntity,
-    CoverEntityFeature,  # Use CoverEntityFeature instead of SUPPORT_* constants
+    CoverEntityFeature,
 )
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from .const import DOMAIN, ARCH, OS
+from .entity import SmarteefiEntity, build_entities
 
 _LOGGER = logging.getLogger(__name__)
 
-_LOGGER.info(f"Domain is {DOMAIN}")
-
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Smarteefi covers from a config entry."""
-    
-    # Get correct integration path
-    INTEGRATION_PATH = hass.config.path(f"custom_components/smarteefi")
-    
-    # Full path to HACLI binary
-    if OS == 'win':
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli.exe")
-    else:
-        HACLI = os.path.join(INTEGRATION_PATH, f"hacli-{OS}-{ARCH}", f"smarteefi-ha-cli")
-    
-    _LOGGER.debug(f"Using HACLI path: {HACLI}")
+    async_add_entities(build_entities(entry, "cover", SmarteefiCover))
 
-    devices = entry.data.get("devices", [])
-
-    if not devices:
-        _LOGGER.error("No devices found for Smarteefi cover.")
-        return
-    
-    # Get host IP address from config_entry
-    ip_address = entry.data.get("ip_address")
-
-    if not ip_address:
-        _LOGGER.error("ip_address not found in config entry!")
-        return
-
-    # Get netmask from config_entry
-    netmask = entry.data.get("netmask")
-
-    if not netmask:
-        _LOGGER.error("netmask not found in config entry!")
-        return            
-
-    # Pass network_interface to SmarteefiCover constructor
-    covers = [SmarteefiCover(device, HACLI, ip_address, netmask) for device in devices if device["type"] == "cover"]
-    async_add_entities(covers, True)
-
-class SmarteefiCover(CoverEntity):
+class SmarteefiCover(SmarteefiEntity, CoverEntity):
     """Representation of a Smarteefi cover."""
 
+    _attr_supported_features = (
+        CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.SET_POSITION
+    )
+
     def __init__(self, device, hacli_path, ip_address, netmask):
-        self._device = device
-        self._state = "closed"  # Assume the cover is closed by default
-        self._name = device.get("name", "Unnamed Cover")  # Set name properly
-        self._unique_id = device.get("id", "")
-        self._cloud_id = device.get("cloudid", "")
-        self._hacli = hacli_path
-        self.ip_address = ip_address
-        self.netmask = netmask
+        super().__init__(device, hacli_path, ip_address, netmask, "Unnamed Cover")
         self._current_position = 0  # Assume the cover is fully closed initially
-        self._update_unsub = None
-        self._smap = None  # Store smap value from entity ID		
 
-        # Extract serial:smap from unique_id (format: "serial:ignored:smap")
-        parts = self._unique_id.split(':')
-        if len(parts) == 3:
-            self._entity_match_id = f"{parts[0]}:{parts[2]}"  # serial:smap
-            self._smap = int(parts[2])
-        else:
-            _LOGGER.error(f"Invalid unique_id format: {self._unique_id}")
-
-    async def async_added_to_hass(self):
-        """Register update dispatcher."""
-        if hasattr(self, '_entity_match_id'):
-            self._update_unsub = async_dispatcher_connect(
-                self.hass,
-                f"{DOMAIN}_device_update_{self._entity_match_id}",
-                self._handle_device_update
-            )
-
-    async def async_will_remove_from_hass(self):
-        """Unregister update dispatcher."""
-        if self._update_unsub:
-            self._update_unsub()
-
-    def _handle_device_update(self, data):
-        """Update state from UDP message."""
-        received_smap = data["smap"]
-        status = data["status"]
-        
-        # Only process if smap matches our entity's smap
-        if received_smap != self._smap:
-            return
-        
-        if status == self._smap:
-            self._state = "open"
-            self._current_position = 100
-        else:
-            self._state = "closed"
-            self._current_position = 0
-
-        self.schedule_update_ha_state()
+    def _apply_status(self, status):
+        # Status may be the combined bitmap of every channel on the board, so test our bit only
+        new_position = 100 if status & self._smap else 0
         _LOGGER.debug(
-            f"Updated cover {self._name} - "
-            f"State: {'Opened' if status else 'Closed'}, "
-            f"Current Position: {self._current_position}, Status: {status}"
-        )        
-
-    @property
-    def name(self):
-        """Return the name of the cover."""
-        return self._name
-
-    @property
-    def unique_id(self):
-        """Return a unique ID for the cover."""
-        return self._unique_id
+            f"Updated cover {self.name} - "
+            f"Current Position: {new_position}, Status: {status}"
+        )
+        if self._current_position == new_position:
+            return False
+        self._current_position = new_position
+        return True
 
     @property
     def is_closed(self):
@@ -132,90 +46,39 @@ class SmarteefiCover(CoverEntity):
         """Return the current position of the cover."""
         return self._current_position
 
-    @property
-    def supported_features(self):
-        """Flag supported features."""
-        return CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.SET_POSITION
-
-    async def _execute_cli(self, command):
-        """Run the HACLI binary with the given command."""
-        full_command = [self._hacli] + command  # Prepend HACLI path
-
-        _LOGGER.debug(f"Executing CLI command: {' '.join(full_command)}")
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._hacli, *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-
-            if process.returncode == 0:
-                _LOGGER.debug(f"Command succeeded: {' '.join(full_command)}, Output: {stdout.decode().strip()}")
-                return True
-            else:
-                _LOGGER.error(f"Command failed: {' '.join(full_command)}, Error: {stderr.decode().strip()}")
-                return False
-        except FileNotFoundError:
-            _LOGGER.error(f"CLI binary not found at {self._hacli}")
-            return False
-        except Exception as e:
-            _LOGGER.error(f"Error executing CLI: {e}")
-            return False
-
     async def async_open_cover(self, **kwargs):
         """Open the cover."""
-        _LOGGER.info("Opening Smarteefi cover: %s", self._name)
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "1"]):
+        _LOGGER.info("Opening Smarteefi cover: %s", self.name)
+        if await self._execute_cli("set-status", "1"):
             self._current_position = 100
-            self._state = "open"
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_close_cover(self, **kwargs):
         """Close the cover."""
-        _LOGGER.info("Closing Smarteefi cover: %s", self._name)
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), "0"]):
+        _LOGGER.info("Closing Smarteefi cover: %s", self.name)
+        if await self._execute_cli("set-status", "0"):
             self._current_position = 0
-            self._state = "closed"
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()
 
     async def async_set_cover_position(self, **kwargs):
         """Move the cover to a specific position."""
-        position = kwargs.get("position", 0)
-        _LOGGER.info(f"Setting Smarteefi cover position to {position}: {self._name}")
+        position = kwargs.get(ATTR_POSITION, 0)
+        _LOGGER.info(f"Setting Smarteefi cover position to {position}: {self.name}")
 
         prev_position = self._current_position
 
-        """Determine the direction."""
+        # Determine the direction and how far to travel
+        if position == prev_position:
+            return
         if position == 0:
-            status = "0"
-            percentage = "0"
+            status, percentage = "0", "0"
         elif position == 100:
-            status = "1"
-            percentage = "0"                     
+            status, percentage = "1", "0"
         elif position > prev_position:
-            status = "1"
-            percentage = str(position - prev_position)
-        elif prev_position > position:
-            status = "0"
-            percentage = str(prev_position - position) 
+            status, percentage = "1", str(position - prev_position)
         else:
-            self._current_position = position
-            if position == 0:
-                self._state = "closed"
-            elif position == 100:
-                self._state = "open"
-            else:
-                self._state = "partially_open"
-            self.schedule_update_ha_state()
+            status, percentage = "0", str(prev_position - position)
 
-        if await self._execute_cli([self.ip_address, self.netmask, "set-status", self._unique_id, str(self._cloud_id), status, percentage]):
+        if await self._execute_cli("set-status", status, percentage):
             self._current_position = position
-            if position == 0:
-                self._state = "closed"
-            elif position == 100:
-                self._state = "open"
-            else:
-                self._state = "partially_open"
-            self.schedule_update_ha_state()
+            self.async_write_ha_state()

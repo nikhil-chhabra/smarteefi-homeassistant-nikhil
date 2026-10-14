@@ -1,2 +1,4 @@
 discover_devices:
   description: Discover devices from smarteefi account and sync with Home Assistant.
+sync_states:
+  description: Poll every Smarteefi device for its current state.
